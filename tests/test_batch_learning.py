@@ -36,6 +36,9 @@ def batch_features(n=180):
         'step_bic_gain': np.where(group == 0, 500., 0.),
         'voltage_response_snr': 10. * np.exp(nudge),
         'voltage_collapse_ratio': .3 + nudge,
+        'edge_excursion_span_fraction': np.where(group == 0, .5, 0.),
+        'edge_paired_response_fraction': np.where(group == 0, .45, 0.),
+        'edge_reference_stable': True, 'current_scale_reliable': True,
     })
 
 
@@ -50,7 +53,8 @@ class BatchLearningTests(unittest.TestCase):
             return learn_batch_states(frame, self.root / folder)
 
     def test_population_selects_groups_without_forcing_four_states(self):
-        result = self.run_learning(batch_features())
+        # v4 增加背景包络维度；使用充足样本支持两个形态群，产品仍由 BIC 选组。
+        result = self.run_learning(batch_features(600))
         metadata = json.loads((self.root / 'out' / '自学习模型.json').read_text())
         self.assertEqual(metadata['learning_status'], 'learned')
         self.assertEqual(metadata['selected_groups'], 2)
@@ -61,7 +65,7 @@ class BatchLearningTests(unittest.TestCase):
         self.assertTrue(result.loc[~unresolved, 'automatic_state'].eq('effective_discharge').all())
 
     def test_component_number_is_not_physical_class_number(self):
-        frame = batch_features()
+        frame = batch_features(600)
         frame['state'] = 'effective_discharge'
         frame['classification_reason'] = 'synthetic_supported_event'
         result = self.run_learning(frame)

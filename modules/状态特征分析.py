@@ -10,6 +10,8 @@ FEATURES = [
     'raw_event_count', 'raw_event_fraction', 'narrow_event_count',
     'max_event_width_samples', 'oscillation_support_fraction',
     'bounded_excursion_span_fraction', 'paired_response_fraction',
+    'edge_excursion_span_fraction', 'edge_paired_response_fraction',
+    'edge_pre_current_A', 'edge_post_current_A', 'edge_pre_std_A', 'edge_post_std_A',
     'pre_sample_count', 'post_sample_count',
     'plateau_fraction', 'post_current_std', 'post_stability_ratio',
     'voltage_drop_snr', 'voltage_collapse_ratio', 'voltage_std',

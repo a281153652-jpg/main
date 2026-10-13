@@ -16,7 +16,8 @@ from modules.放电状态识别 import MODEL_VERSION, STATES
 from modules.判别证据审计 import write_decision_audit
 
 
-BATCH_VERSION = 'batch-morphology-v2'
+BATCH_VERSION = 'batch-morphology-v3'
+SUPPORTED_FEATURE_VERSIONS = ('dynamic-screening-v3', MODEL_VERSION)
 RESOLVED = ('open_circuit', 'effective_discharge', 'short_circuit')
 UNDETERMINED = 'undetermined'
 REQUIRED = (
@@ -64,6 +65,10 @@ def _feature_frame(frame):
                  'plateau_fraction', 'post_stability_ratio', 'transition_fraction'):
         values[name] = pd.to_numeric(frame[name], errors='coerce')
     values['voltage_collapse_asinh'] = np.arcsinh(frame['voltage_collapse_ratio'])
+    if frame['model_version'].eq(MODEL_VERSION).all():
+        for name in ('edge_excursion_span_fraction', 'edge_paired_response_fraction'):
+            values[name] = pd.to_numeric(frame[name], errors='coerce')
+        values['edge_reference_stable'] = frame['edge_reference_stable'].astype(float)
     return values.replace([np.inf, -np.inf], np.nan)
 
 
@@ -129,8 +134,14 @@ def learn_batch_states(results, output_dir, config=None, source_info=None):
         raise ValueError(f'批次学习缺少特征列，需运行当前主程序重新提取: {sorted(missing)}')
     if results['cycle_id'].duplicated().any():
         raise ValueError('批次内 cycle_id 必须唯一')
-    if not results['model_version'].eq(MODEL_VERSION).all():
-        raise ValueError('仅支持当前 v3 原始特征；旧 v2 特征必须重新提取')
+    versions = results['model_version'].drop_duplicates().tolist()
+    if len(versions) != 1 or versions[0] not in SUPPORTED_FEATURE_VERSIONS:
+        raise ValueError('只支持同一版本的 v3/v4 特征；旧 v2 或混合版本必须重新提取')
+    if versions[0] == MODEL_VERSION:
+        extra = {'edge_excursion_span_fraction', 'edge_paired_response_fraction',
+                 'edge_reference_stable', 'current_scale_reliable'} - set(results.columns)
+        if extra:
+            raise ValueError(f'v4 特征缺少背景包络信息，需重新提取: {sorted(extra)}')
     if not results['state'].isin(STATES).all():
         raise ValueError('包含未支持的原始状态')
     original_order = results.index
@@ -159,13 +170,16 @@ def learn_batch_states(results, output_dir, config=None, source_info=None):
         untrusted_noise = (work['current_noise_model'].eq('numerical_floor')
                            & (work['raw_event_fraction'].gt(0) | work['robust_I_pp'].gt(0)))
     work['noise_scale_reliable_for_learning'] = ~untrusted_noise
-    work.loc[valid & untrusted_noise, ['automatic_state', 'decision_status', 'batch_reason',
+    if 'current_scale_reliable' in work:
+        untrusted_noise |= work['current_scale_reliable'].eq(False) & work['data_quality'].eq('ok')
+        work['noise_scale_reliable_for_learning'] = ~untrusted_noise
+    work.loc[work['data_quality'].eq('ok') & untrusted_noise, ['automatic_state', 'decision_status', 'batch_reason',
                                        'review_priority']] = [UNDETERMINED, 'undetermined',
                                                               'untrusted_numerical_noise_floor', 'high']
     valid &= ~untrusted_noise
     order = work.loc[valid].sort_values('cycle_id').index
     metadata = {
-        'batch_model_version': BATCH_VERSION, 'feature_model_version': MODEL_VERSION,
+        'batch_model_version': BATCH_VERSION, 'feature_model_version': versions[0],
         'learning_method': 'robust_scaling_full_gaussian_mixture_bic',
         'config': asdict(config), 'valid_cycles': int(valid.sum()),
         'uses_manual_labels': False, 'physical_accuracy_validated': False,

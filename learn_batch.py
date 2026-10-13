@@ -1,4 +1,4 @@
-"""已有 v3 特征表可直接自学习，无需重新读取百万点波形。"""
+"""已有 v3/v4 特征表可直接自学习；新增 v4 波形特征需要从原始数据提取。"""
 import argparse
 import hashlib
 from pathlib import Path
@@ -7,8 +7,8 @@ from modules.批次自学习 import learn_batch_states
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description='从 v3 动态特征学习本批次的波形形态分布')
-    parser.add_argument('feature_file', help='当前 v3 放电状态结果.csv')
+    parser = argparse.ArgumentParser(description='从同一版本的 v3/v4 动态特征学习波形形态分布')
+    parser.add_argument('feature_file', help='v3 或 v4 放电状态结果.csv')
     parser.add_argument('--output', default='./输出结果/批次自学习', help='独立学习结果目录')
     args = parser.parse_args(argv)
     path = Path(args.feature_file)

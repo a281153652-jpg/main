@@ -19,6 +19,8 @@ def write_decision_audit(results, output_dir, config=None):
                'current_level_step_A', 'activity_snr', 'sample_count', 'raw_event_count',
                'max_event_width_samples', 'oscillation_support_fraction',
                'bounded_excursion_span_fraction', 'paired_response_fraction',
+               'current_scale_reliable', 'edge_pre_current_A', 'edge_post_current_A',
+               'edge_reference_stable', 'edge_excursion_span_fraction', 'edge_paired_response_fraction',
                'pre_sample_count', 'post_sample_count', 'plateau_supported']
     audit = results[[c for c in columns if c in results]].copy()
     n = numeric('sample_count').where(lambda s: s > 0)
@@ -40,6 +42,11 @@ def write_decision_audit(results, output_dir, config=None):
                                              & audit['raw_longest_event_fraction'].ge(config.oscillation_persistence))
     audit['numerical_scale_requires_review'] = ~results.get(
         'noise_scale_reliable_for_learning', pd.Series(True, index=results.index))
+    if 'edge_reference_stable' in results:
+        audit['edge_background_event_supported'] = (
+            results['edge_reference_stable'].eq(True)
+            & numeric('edge_excursion_span_fraction').ge(config.oscillation_persistence)
+            & numeric('edge_paired_response_fraction').ge(config.oscillation_persistence))
     flags = ('long_raw_event_without_bounded_support', 'resolution_limited_long_event',
              'numerical_scale_requires_review')
     audit['diagnostic_flags'] = [';'.join(name for name in flags if bool(audit.at[index, name]))
@@ -49,7 +56,7 @@ def write_decision_audit(results, output_dir, config=None):
     audit.to_csv(output / '判别证据审计.csv', index=False, encoding='utf-8-sig')
     metadata = {
         'reference_dynamic_config': asdict(config),
-        'reference_config_note': '仅按给定/默认 v3 参数审计；不会重新分类，不等于已发现误判。',
+        'reference_config_note': '仅按给定/默认动态参数审计；不会重新分类，不等于已发现误判。',
         'diagnostic_counts': {name: int(audit[name].sum()) for name in flags},
         'raw_waveforms_available_in_feature_table': False,
         'long_raw_event_note': '原始事件长而内部有界事件支持不足，可能涉及周期截断、基线选择或事件破碎；需原始样本核查。',

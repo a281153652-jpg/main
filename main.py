@@ -29,12 +29,21 @@ def main(argv=None):
                         help='已测定的零电流偏置(A)，默认不校正；不是状态分类阈值')
     parser.add_argument('--cycles', help='复用同一 CSV 先前自动检测的周期表，以固定边界比较模型')
     parser.add_argument('--learning', choices=('batch', 'off'), default='batch',
-                        help='默认自动学习本批次形态分布；off 仅运行 v3 动态筛查')
+                        help='默认自动学习本批次形态分布；off 仅运行动态筛查')
+    parser.add_argument('--expected-source-sha256', help='核对原始 CSV 的已知 SHA-256，避免复用错误文件的周期表')
     args = parser.parse_args(argv)
     if not Path(args.input_file).is_file():
         parser.error(f'找不到输入数据: {args.input_file}')
     if args.examples < 1:
         parser.error('--examples 必须为正整数')
+    if args.expected_source_sha256 is not None:
+        expected_hash = args.expected_source_sha256.lower()
+        if len(expected_hash) != 64 or any(c not in '0123456789abcdef' for c in expected_hash):
+            parser.error('--expected-source-sha256 必须为 64 位十六进制字符串')
+    with open(args.input_file, 'rb') as source:
+        source_hash = hashlib.file_digest(source, 'sha256').hexdigest()
+    if args.expected_source_sha256 and source_hash != args.expected_source_sha256.lower():
+        parser.error('原始 CSV SHA-256 与预期不一致，未执行识别或覆盖结果')
     output = Path(args.output)
     print('高低压复合放电分析系统\n分析文件:', args.input_file)
     data = load_waveform_data(args.input_file)
@@ -57,13 +66,13 @@ def main(argv=None):
         })
     if args.cycles:
         cycles.to_csv(output / '周期信息.csv', index=False, encoding='utf-8-sig')
-    with open(args.input_file, 'rb') as source:
-        source_hash = hashlib.file_digest(source, 'sha256').hexdigest()
     (output / '运行来源.json').write_text(json.dumps({
         'input_filename': Path(args.input_file).name, 'source_sha256': source_hash,
         'input_samples': len(data), 'first_time_s': float(data['time'].iloc[0]),
         'last_time_s': float(data['time'].iloc[-1]),
         'cycles_reused_from': args.cycles, 'experimental_labels_validated': False,
+        'expected_source_sha256': args.expected_source_sha256,
+        'source_hash_matched_expected': bool(args.expected_source_sha256),
     }, ensure_ascii=False, indent=2), encoding='utf-8')
     result_file = output / '放电状态结果.csv'
     analyze_features(result_file, output)

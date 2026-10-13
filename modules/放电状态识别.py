@@ -9,7 +9,7 @@ from scipy.integrate import trapezoid
 from scipy.ndimage import median_filter
 
 STATES = ('open_circuit', 'effective_discharge', 'short_circuit', 'abnormal_discharge')
-MODEL_VERSION = 'dynamic-screening-v3'
+MODEL_VERSION = 'dynamic-screening-v4'
 
 
 @dataclass(frozen=True)
@@ -117,6 +117,52 @@ def _event_metrics(raw, filtered, voltage, baseline, sigma_i, mad_sigma_i, step,
         'paired_response_fraction': paired,
         'pulse_response_supported': (span >= config.oscillation_persistence
                                      and paired >= config.oscillation_persistence),
+    }
+
+
+def _edge_excursion_metrics(current, voltage, sigma_i, sigma_u, config):
+    """以两端稳定区形成背景包络；背景不同不等于零点漂移校正。"""
+    n = len(current)
+    guard = max(1, n // 20)
+    left, right = current[:guard], current[-guard:]
+    pre, post = float(np.median(left)), float(np.median(right))
+    pre_std, post_std = float(np.std(left)), float(np.std(right))
+    stable = (guard >= config.min_samples
+              and pre_std <= config.noise_multiplier * sigma_i
+              and post_std <= config.noise_multiplier * sigma_i)
+    lower, upper = min(pre, post), max(pre, post)
+    limit = config.noise_multiplier * sigma_i
+    outside = (current < lower - limit) | (current > upper + limit)
+    starts, ends = _runs(outside)
+    merged = []
+    for start, end in zip(starts, ends):
+        if merged and start - merged[-1][1] <= config.median_window:
+            merged[-1][1] = int(end)
+        else:
+            merged.append([int(start), int(end)])
+    bounded = [(start, end) for start, end in merged if start >= guard and end <= n - guard]
+    reference = float(np.quantile(np.abs(voltage), .9))
+    voltage_response = reference - np.abs(voltage) > config.noise_multiplier * sigma_u
+    # 每个完整事件分别查联合支持；最长事件无响应时不能遮蔽另一个有效候选。
+    overlaps = np.r_[0, np.cumsum(outside & voltage_response)]
+    candidates = [(start, end, (end - start) / n,
+                   float((overlaps[end] - overlaps[start]) / (n - 2 * guard)))
+                  for start, end in bounded]
+    qualified = [event for event in candidates
+                 if event[2] >= config.oscillation_persistence
+                 and event[3] >= config.oscillation_persistence]
+    start, end, span, paired = max(qualified or candidates,
+                                    key=lambda event: (event[2], event[3]), default=(0, 0, 0., 0.))
+    return {
+        'edge_pre_current_A': pre, 'edge_post_current_A': post,
+        'edge_pre_std_A': pre_std, 'edge_post_std_A': post_std,
+        'edge_reference_sample_count': guard, 'edge_reference_stable': stable,
+        'edge_candidate_event_count': len(candidates),
+        'edge_supported_event_count': len(qualified) if stable else 0,
+        'edge_excursion_start_index': start, 'edge_excursion_end_index': end,
+        'edge_excursion_span_fraction': span,
+        'edge_paired_response_fraction': paired,
+        'edge_pulse_response_supported': stable and bool(qualified),
     }
 
 
@@ -261,7 +307,14 @@ def extract_features(cycle, config=None):
     })
     features.update(_event_metrics(current, filtered, filtered_u, baseline_i,
                                   sigma_i, mad_i, level_step_i, sigma_u, config))
+    features.update(_edge_excursion_metrics(filtered, filtered_u, sigma_i, sigma_u, config))
     features.update(_step_metrics(filtered, filtered_u, sigma_i, sigma_u, config))
+    features['current_scale_reliable'] = not (noise_model_i == 'numerical_floor'
+                                               and features['raw_event_count'] > 0)
+    if not features['current_scale_reliable']:
+        # 舍入下限不能作为测量噪声来产生巨大 SNR；保留原尺度及形态以便核查。
+        for name in ('activity_snr', 'jump_snr', 'post_current_snr'):
+            features[name] = np.nan
     return features
 
 
@@ -272,6 +325,8 @@ def classify_with_evidence(features, config=None):
         raise ValueError('特征模型版本不匹配，必须从原始波形重新提取特征')
     if features['data_quality'] != 'ok':
         return 'abnormal_discharge', features['data_quality'], 0.0
+    if not features['current_scale_reliable']:
+        return 'abnormal_discharge', 'unreliable_current_noise_scale', 0.0
     z = config.noise_multiplier
     oscillatory = (features['reversal_count'] >= config.min_reversals
                    and features['oscillation_index'] >= config.oscillation_persistence
@@ -303,6 +358,8 @@ def classify_with_evidence(features, config=None):
         return 'effective_discharge', 'sustained_oscillation_with_voltage_response', short_score
     if features['pulse_response_supported'] and features['voltage_response_snr'] > z:
         return 'effective_discharge', 'coherent_current_excursion_with_voltage_response', short_score
+    if features['edge_pulse_response_supported'] and features['voltage_response_snr'] > z:
+        return 'effective_discharge', 'complete_excursion_outside_edge_backgrounds', short_score
     reason = 'oscillation_without_voltage_response' if oscillatory else 'active_without_clear_dynamic_pattern'
     return 'abnormal_discharge', reason, short_score
 

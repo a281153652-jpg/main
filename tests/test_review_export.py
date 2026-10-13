@@ -12,6 +12,7 @@ import pandas as pd
 
 from modules.周期复核导出 import export_review_cycles
 from test_discharge_states import waveform
+from modules.放电状态识别 import MODEL_VERSION
 
 
 class ReviewExportTests(unittest.TestCase):
@@ -95,7 +96,7 @@ class ReviewExportTests(unittest.TestCase):
                            '--examples', '1'])
         self.assertEqual(result['cycle_id'].tolist(), self.results['cycle_id'].tolist())
         self.assertEqual(result['start_index'].tolist(), self.results['start_index'].tolist())
-        self.assertEqual(set(result['model_version']), {'dynamic-screening-v3'})
+        self.assertEqual(set(result['model_version']), {MODEL_VERSION})
         metadata = json.loads((self.root / 'analysis' / '运行来源.json').read_text(encoding='utf-8'))
         self.assertEqual(metadata['source_sha256'], hashlib.sha256(source.read_bytes()).hexdigest())
         self.assertEqual(metadata['cycles_reused_from'], str(table))
