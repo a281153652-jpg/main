@@ -13,9 +13,10 @@ from sklearn.mixture import GaussianMixture
 from threadpoolctl import threadpool_limits
 
 from modules.放电状态识别 import MODEL_VERSION, STATES
+from modules.判别证据审计 import write_decision_audit
 
 
-BATCH_VERSION = 'batch-morphology-v1'
+BATCH_VERSION = 'batch-morphology-v2'
 RESOLVED = ('open_circuit', 'effective_discharge', 'short_circuit')
 UNDETERMINED = 'undetermined'
 REQUIRED = (
@@ -152,6 +153,16 @@ def learn_batch_states(results, output_dir, config=None, source_info=None):
               & np.isfinite(work['activity_snr']) & np.isfinite(work['robust_I_pp']))
     work.loc[~valid, ['automatic_state', 'decision_status', 'batch_reason', 'review_priority']] = [
         UNDETERMINED, 'undetermined', 'invalid_features_or_data', 'high']
+    untrusted_noise = pd.Series(False, index=work.index)
+    if 'current_noise_model' in work:
+        # 数字常值零电流可保留；存在事件时，数值舍入下限不代表测量噪声。
+        untrusted_noise = (work['current_noise_model'].eq('numerical_floor')
+                           & (work['raw_event_fraction'].gt(0) | work['robust_I_pp'].gt(0)))
+    work['noise_scale_reliable_for_learning'] = ~untrusted_noise
+    work.loc[valid & untrusted_noise, ['automatic_state', 'decision_status', 'batch_reason',
+                                       'review_priority']] = [UNDETERMINED, 'undetermined',
+                                                              'untrusted_numerical_noise_floor', 'high']
+    valid &= ~untrusted_noise
     order = work.loc[valid].sort_values('cycle_id').index
     metadata = {
         'batch_model_version': BATCH_VERSION, 'feature_model_version': MODEL_VERSION,
@@ -159,6 +170,8 @@ def learn_batch_states(results, output_dir, config=None, source_info=None):
         'config': asdict(config), 'valid_cycles': int(valid.sum()),
         'uses_manual_labels': False, 'physical_accuracy_validated': False,
         'membership_is_physical_state_probability': False,
+        'distribution_outlier_overrides_physical_evidence': False,
+        'excluded_numerical_noise_floor_cycles': int(untrusted_noise.sum()),
         'state_mapping': 'per_cycle_physical_evidence; clusters describe morphology only',
         'learning_status': 'insufficient_cycles',
         'source_info': source_info or {},
@@ -196,10 +209,13 @@ def learn_batch_states(results, output_dir, config=None, source_info=None):
                 boundary = supported & ~atypical & ~typical
                 work.loc[order[boundary], 'review_priority'] = 'medium'
                 work.loc[order[boundary], 'batch_reason'] = 'overlapping_morphology_groups'
-                # 离群不等于异常加工；仅对其拒绝给出确定自动状态。
-                work.loc[order[atypical], ['automatic_state', 'decision_status', 'batch_reason',
-                                          'review_priority']] = [UNDETERMINED, 'undetermined',
-                                                                 'distribution_outlier', 'high']
+                # 统计少见不能单独否定已有动态证据；保留建议并提高抽查优先级。
+                work.loc[order[atypical & supported], ['decision_status', 'batch_reason',
+                                                      'review_priority']] = [
+                    'physical_evidence_candidate', 'dynamic_evidence_with_atypical_morphology', 'high']
+                work.loc[order[atypical & ~supported], ['decision_status', 'batch_reason',
+                                                       'review_priority']] = [
+                    'undetermined', 'distribution_outlier_without_physical_evidence', 'high']
                 metadata.update({
                     'learning_status': 'learned', 'selected_groups': model.n_components,
                     'distance_limit_squared': limit,
@@ -209,7 +225,7 @@ def learn_batch_states(results, output_dir, config=None, source_info=None):
                                 'reg_covar': model.reg_covar},
                 })
     work['batch_learning_status'] = metadata['learning_status']
-    if 'review_required' in work:
+    if 'review_required' in work and 'dynamic_review_required' not in work:
         work['dynamic_review_required'] = work['review_required']
     # 这里是抽查调度标记，不是物理准确性已经验证的声明。
     work['review_required'] = work['review_priority'].eq('high')
@@ -245,6 +261,7 @@ def learn_batch_states(results, output_dir, config=None, source_info=None):
     stats.rename_axis('automatic_state').rename('cycles').to_csv(output / '自动判别统计.csv', encoding='utf-8-sig')
     (output / '自学习模型.json').write_text(json.dumps(metadata, ensure_ascii=False, indent=2,
                                                      allow_nan=False) + '\n', encoding='utf-8')
+    write_decision_audit(work, output)
     print('\n整批特征自学习:', metadata['learning_status'], '| 形态群组:', metadata.get('selected_groups', 0))
     print('自动状态建议（undetermined 表示证据不足，不计为异常加工）:')
     print(stats.to_string())

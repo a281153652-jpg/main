@@ -150,13 +150,53 @@ class BatchLearningTests(unittest.TestCase):
         pd.testing.assert_frame_equal(result[frame.columns], frame)
         self.assertTrue((self.root / 'out' / '自动判别统计.csv').is_file())
 
-    def test_rare_supported_event_is_not_named_abnormal_from_rarity(self):
+    def test_rarity_alone_does_not_overrule_supported_event(self):
         frame = batch_features()
         frame.loc[0, 'activity_snr'] = 1e90
         result = self.run_learning(frame)
         self.assertTrue(result.loc[0, 'distribution_outlier'])
-        self.assertEqual(result.loc[0, 'automatic_state'], 'undetermined')
+        self.assertEqual(result.loc[0, 'automatic_state'], 'effective_discharge')
         self.assertEqual(result.loc[0, 'state'], 'effective_discharge')
+        self.assertEqual(result.loc[0, 'batch_reason'], 'dynamic_evidence_with_atypical_morphology')
+        self.assertTrue(result.loc[0, 'review_required'])
+
+    def test_numerical_noise_floor_with_events_is_not_learning_evidence(self):
+        frame = batch_features()
+        frame['current_noise_model'] = 'measured_mad'
+        frame.loc[0, 'current_noise_model'] = 'numerical_floor'
+        frame.loc[0, 'noise_current'] = 1e-14
+        frame.loc[0, 'activity_snr'] = 1e50
+        result = self.run_learning(frame)
+        self.assertEqual(result.loc[0, 'morphology_cluster'], -1)
+        self.assertEqual(result.loc[0, 'automatic_state'], 'undetermined')
+        self.assertEqual(result.loc[0, 'batch_reason'], 'untrusted_numerical_noise_floor')
+        metadata = json.loads((self.root / 'out' / '自学习模型.json').read_text())
+        self.assertEqual(metadata['excluded_numerical_noise_floor_cycles'], 1)
+
+    def test_exact_constant_zero_is_not_rejected_as_event_scale(self):
+        frame = batch_features()
+        frame['current_noise_model'] = 'measured_mad'
+        frame.loc[0, 'current_noise_model'] = 'numerical_floor'
+        frame.loc[0, ['activity_snr', 'robust_I_pp', 'raw_event_fraction']] = 0
+        frame.loc[0, 'state'] = 'open_circuit'
+        result = self.run_learning(frame)
+        self.assertTrue(result.loc[0, 'noise_scale_reliable_for_learning'])
+        self.assertGreaterEqual(result.loc[0, 'morphology_cluster'], 0)
+
+    def test_bounded_event_mismatch_is_audit_only(self):
+        frame = batch_features()
+        frame.loc[0, 'bounded_excursion_span_fraction'] = 0
+        result = self.run_learning(frame)
+        audit = pd.read_csv(self.root / 'out' / '判别证据审计.csv')
+        self.assertTrue(audit.loc[0, 'long_raw_event_without_bounded_support'])
+        self.assertEqual(result.loc[0, 'state'], frame.loc[0, 'state'])
+
+    def test_rerun_keeps_original_dynamic_review_marker(self):
+        frame = batch_features()
+        frame['review_required'] = True
+        a = self.run_learning(frame, 'a')
+        b = self.run_learning(a, 'b')
+        self.assertTrue(b['dynamic_review_required'].all())
 
 
 if __name__ == '__main__':
