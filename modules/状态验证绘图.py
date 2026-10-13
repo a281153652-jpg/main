@@ -55,13 +55,17 @@ def plot_state_examples(data, results, output_dir, number=10):
                 'cycle_id': row['cycle_id'], 'suggested_state': state,
                 'classification_reason': row['classification_reason'],
                 'data_quality': row['data_quality'], 'image_path': str(path.relative_to(output)),
+                'automatic_state': row.get('automatic_state', state),
+                'review_priority': row.get('review_priority', 'high'),
+                'morphology_cluster': row.get('morphology_cluster', -1),
                 'reviewed_state': '', 'review_notes': '',
             })
         summary.append({'state': state, 'available_cycles': len(group), 'plotted_cycles': count,
                         'requested_cycles': number, 'status': 'enough' if count == number else 'insufficient'})
     output.mkdir(parents=True, exist_ok=True)
     checklist = pd.DataFrame(manifest, columns=['cycle_id', 'suggested_state', 'classification_reason',
-                                               'data_quality', 'image_path', 'reviewed_state', 'review_notes'])
+                                               'data_quality', 'image_path', 'automatic_state', 'review_priority',
+                                               'morphology_cluster', 'reviewed_state', 'review_notes'])
     # 新批次清单保存在图片目录中，保留已有人工复核记录。
     folder.mkdir(parents=True, exist_ok=True)
     checklist.to_csv(folder / '人工复核清单.csv', index=False, encoding='utf-8-sig')
