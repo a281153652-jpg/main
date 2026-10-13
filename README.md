@@ -33,7 +33,7 @@ git pull --ff-only
 .venv/bin/python setup_python312.py
 ```
 
-脚本优先使用已有 Python 3.12；缺失时通过 uv 获取解释器，建立独立 `.venv-py312` 并安装固定依赖。原 `.venv` 和实验文件保留，已有异常目标目录不会被覆盖。自动下载需要网络。后续使用 `.venv-py312/bin/python` 运行程序。
+脚本优先使用已有 Python 3.12；缺失时通过 uv 获取解释器，建立独立 `.venv-py312` 并安装固定依赖。系统 Python 缺少 `ensurepip` 时使用 uv 补齐目标环境的 pip，无需安装系统 `python3.12-venv` 包。先前已生成但缺 pip 的有效新环境可以接着修复，不需删除。原 `.venv` 和实验文件保留，已有异常目标目录不会被覆盖。自动下载需要网络。后续使用 `.venv-py312/bin/python` 运行程序。
 
 已经完成 v4 特征提取时，先只重跑批次学习，检查警告，无需重读原始波形：
 

@@ -10,6 +10,7 @@ import sys
 ROOT = Path(__file__).resolve().parent
 TARGET = ROOT / '.venv-py312'
 UV_BOOTSTRAP_VERSION = '0.12.23'
+PIP_RECOVERY_VERSION = '26.2.1'
 
 
 def python_in(folder):
@@ -44,11 +45,73 @@ def is_virtual_environment(folder):
         return False
 
 
+def runtime_environment():
+    runtime = ROOT / '.runtime'
+    if runtime.is_symlink():
+        raise RuntimeError('.runtime 是符号链接，未修改。')
+    runtime.mkdir(exist_ok=True)
+    env = os.environ.copy()
+    env['UV_CACHE_DIR'] = str(runtime / 'uv-cache')
+    env['UV_PYTHON_INSTALL_DIR'] = str(runtime / 'python')
+    env['PIP_CACHE_DIR'] = str(runtime / 'pip-cache')
+    return env
+
+
+def ensure_uv():
+    env = runtime_environment()
+    installed = shutil.which('uv')
+    if installed:
+        return installed, env
+    # 用现有启动环境的 pip 安装到专用工具目录，不再依赖工具 venv 的 ensurepip。
+    tools = ROOT / '.runtime' / f'uv-tools-{UV_BOOTSTRAP_VERSION}'
+    marker = tools / '.setup-managed'
+    if tools.is_symlink() or (tools.exists() and not tools.is_dir()):
+        raise RuntimeError('独立 uv 工具路径异常，未修改。')
+    if tools.exists() and any(tools.iterdir()) and not marker.is_file():
+        raise RuntimeError('已有 uv 工具目录不是脚本管理的目录，未覆盖。')
+    for name in ('bin', 'Scripts', 'uv'):
+        if (tools / name).is_symlink():
+            raise RuntimeError('uv 工具子目录是符号链接，未修改。')
+    tools.mkdir(exist_ok=True)
+    marker.write_text(UV_BOOTSTRAP_VERSION + '\n', encoding='utf-8')
+    name = 'uv.exe' if os.name == 'nt' else 'uv'
+    candidates = [tools / directory / name for directory in ('bin', 'Scripts', 'uv')]
+
+    def tool_binary():
+        for candidate in candidates:
+            if candidate.is_symlink():
+                raise RuntimeError('uv 可执行程序是符号链接，未修改。')
+            if candidate.is_file():
+                try:
+                    version = subprocess.check_output([str(candidate), '--version'], text=True).split()[1]
+                    if version == UV_BOOTSTRAP_VERSION:
+                        return candidate
+                except (OSError, subprocess.CalledProcessError, IndexError):
+                    pass
+        return None
+
+    executable = tool_binary()
+    if executable is None:
+        run([sys.executable, '-m', 'pip', 'install', '--no-input', '--upgrade',
+             '--target', tools, f'uv=={UV_BOOTSTRAP_VERSION}'], env=env)
+        executable = tool_binary()
+    if executable is None:
+        raise RuntimeError('uv 工具安装后未找到可执行程序。')
+    return executable, env
+
+
 def ensure_pip(executable):
     probe = subprocess.run([str(executable), '-m', 'pip', '--version'],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    if probe.returncode:
-        run([executable, '-m', 'ensurepip', '--upgrade'])
+    if not probe.returncode:
+        return
+    recovery = subprocess.run([str(executable), '-m', 'ensurepip', '--upgrade'],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if recovery.returncode:
+        print('目标环境缺少 ensurepip，使用 uv 补齐 pip。', flush=True)
+        uv, env = ensure_uv()
+        run([uv, 'pip', 'install', '--python', executable, f'pip=={PIP_RECOVERY_VERSION}'], env=env)
+    run([executable, '-m', 'pip', '--version'])
 
 
 def ensure_python312():
@@ -63,29 +126,12 @@ def ensure_python312():
     candidates = [sys.executable, shutil.which('python3.12')]
     for candidate in candidates:
         if candidate and version_of(candidate) == '3.12':
-            run([candidate, '-m', 'venv', TARGET])
+            run([candidate, '-m', 'venv', '--without-pip', TARGET])
             return executable
     # uv 自动获取所需解释器；工具与解释器放在仓库内独立目录，不改旧 .venv。
-    runtime = ROOT / '.runtime'
-    if runtime.is_symlink():
-        raise RuntimeError('.runtime 是符号链接，未修改。')
-    runtime.mkdir(exist_ok=True)
-    env = os.environ.copy()
-    env['UV_CACHE_DIR'] = str(runtime / 'uv-cache')
-    env['UV_PYTHON_INSTALL_DIR'] = str(runtime / 'python')
-    uv = shutil.which('uv')
-    if uv is None:
-        bootstrap = runtime / 'bootstrap'
-        bootstrap_python = python_in(bootstrap)
-        if bootstrap.is_symlink() or (bootstrap.exists() and not is_virtual_environment(bootstrap)):
-            raise RuntimeError('已有工具目录不完整，未覆盖 .runtime/bootstrap。')
-        if not bootstrap.exists():
-            run([sys.executable, '-m', 'venv', bootstrap])
-        ensure_pip(bootstrap_python)
-        run([bootstrap_python, '-m', 'pip', 'install', '--no-input', f'uv=={UV_BOOTSTRAP_VERSION}'])
-        uv = bootstrap / ('Scripts/uv.exe' if os.name == 'nt' else 'bin/uv')
+    uv, env = ensure_uv()
     print('未找到系统 Python 3.12，使用 uv 获取独立解释器。', flush=True)
-    run([uv, 'venv', '--python', '3.12', '--seed', TARGET], env=env)
+    run([uv, 'venv', '--python', '3.12', TARGET], env=env)
     return executable
 
 
