@@ -16,12 +16,32 @@ Python 3.12，使用现有仓库目录，无需另建 Git worktree。
 
 ```bash
 cd /workspace/main
-python -m venv .venv
+python3.12 -m venv .venv
 .venv/bin/python -m pip install --no-input -r requirements.txt
 .venv/bin/python main.py "输入数据/gyb1-4.csv" --output "输出结果" --examples 10
 ```
 
 Windows 可用 `py -3.12 -m venv .venv`，再用 `.venv\Scripts\python.exe` 运行 pip 与 `main.py`。
+
+### 恢复一致的运行环境
+
+如果现有 `.venv` 使用 Python 3.14，可由它直接运行环境准备脚本：
+
+```bash
+cd /workspaces/main/waveform-analysis-v2
+git pull --ff-only
+.venv/bin/python setup_python312.py
+```
+
+脚本优先使用已有 Python 3.12；缺失时通过 uv 获取解释器，建立独立 `.venv-py312` 并安装固定依赖。原 `.venv` 和实验文件保留，已有异常目标目录不会被覆盖。自动下载需要网络。后续使用 `.venv-py312/bin/python` 运行程序。
+
+已经完成 v4 特征提取时，先只重跑批次学习，检查警告，无需重读原始波形：
+
+```bash
+.venv-py312/bin/python -W error::FutureWarning learn_batch.py "../输出结果/动态特征复核_v4/放电状态结果.csv" --output "../输出结果/批次自学习_v4_py312"
+```
+
+Python 3.14 / pandas 2.2.3 下出现的兼容性警告不能仅靠关闭警告解决，也不能单凭警告文字断言结果已损坏。项目验证基线为 Python 3.12，独立环境用于恢复可重复运行。
 
 默认输入为 `输入数据/gyb1-4.csv`；也可以指定其他路径。没有真实 CSV 时程序会明确报告输入缺失，不会用合成数据代替实验结果。时间须为秒，电压/电流须已正确标定到 V/A，识别器接收 `time/voltage/current` 标准列。
 

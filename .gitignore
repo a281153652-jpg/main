@@ -1,5 +1,6 @@
 __pycache__/
 *.py[cod]
-.venv/
+.venv*/
+.runtime/
 输入数据/
 输出结果/
