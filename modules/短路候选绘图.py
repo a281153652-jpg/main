@@ -1,4 +1,6 @@
 from pathlib import Path
+from datetime import datetime, timezone
+from uuid import uuid4
 
 import pandas as pd
 
@@ -25,9 +27,12 @@ def plot_short_candidates(input_file, score_file, output_dir, number=10, *, data
         if candidate[['start_index', 'end_index']].isna().any().any():
             raise ValueError('候选周期无法匹配周期边界，请重新生成候选表')
     paths = []
+    batch = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '_' + uuid4().hex[:6]
+    folder = Path(output_dir) / batch
     for _, row in candidate.iterrows():
-        path = Path(output_dir) / f"cycle_{int(row['cycle_id'])}.png"
+        path = folder / f"cycle_{int(row['cycle_id'])}.png"
         title = f"Short candidate cycle {int(row['cycle_id'])} | evidence score={row['short_score']:.2f}"
         plot_cycle(data, row, path, title=title)
         paths.append(path)
+    print('本次短路候选图目录:', folder)
     return paths

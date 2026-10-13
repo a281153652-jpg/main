@@ -9,7 +9,7 @@ from scipy.integrate import trapezoid
 from scipy.ndimage import median_filter
 
 STATES = ('open_circuit', 'effective_discharge', 'short_circuit', 'abnormal_discharge')
-MODEL_VERSION = 'dynamic-screening-v2'
+MODEL_VERSION = 'dynamic-screening-v3'
 
 
 @dataclass(frozen=True)
@@ -50,6 +50,76 @@ def _noise_sigma(values, windows):
     return max(float(np.quantile(estimates, 0.25)), floor)
 
 
+def _resolution_model(values, windows):
+    """估计重复电平网格，不把观测网格间距当作已知硬件 ADC 分辨率。
+
+    对相容的离散网格采用均匀量化误差尺度 q/sqrt(12) 作为保守界。
+    两个电平不足以估计 q；大幅真实阶跃不能据此被当成噪声。
+    """
+    mad_sigma = _noise_sigma(values, windows)
+    levels, counts = np.unique(values, return_counts=True)
+    step = 0.0
+    floor = np.finfo(float).eps * max(1., float(np.max(np.abs(values)))) * 32
+    if 3 <= len(levels) <= len(values) // 2:
+        gaps = np.diff(levels)
+        gaps = gaps[gaps > floor]
+        if len(gaps) >= 2:
+            candidate = float(np.min(gaps))
+            multiples = gaps / candidate
+            if np.all(np.abs(multiples - np.rint(multiples)) <= 1e-6):
+                step = candidate
+    scale = max(mad_sigma, step / np.sqrt(12))
+    if step and scale > mad_sigma:
+        model = 'quantized_resolution_bound'
+    elif mad_sigma <= floor:
+        model = 'numerical_floor'
+    else:
+        model = 'measured_mad'
+    baseline = float(levels[np.argmax(counts)]) if step else float(np.median(values))
+    return scale, mad_sigma, step, model, baseline
+
+
+def _runs(mask):
+    changes = np.diff(np.r_[False, mask, False].astype(int))
+    return np.flatnonzero(changes == 1), np.flatnonzero(changes == -1)
+
+
+def _event_metrics(raw, filtered, voltage, baseline, sigma_i, mad_sigma_i, step, sigma_u, config):
+    """区分事件持续时间和转折点分布；基线只用于形态，不校正测量零点。"""
+    n = len(raw)
+    guard = max(1, n // 20)
+    raw_limit = max(config.noise_multiplier * mad_sigma_i, step / 2)
+    raw_mask = np.abs(raw - baseline) > raw_limit
+    starts, ends = _runs(raw_mask)
+    lengths = ends - starts
+    significant = np.abs(filtered - baseline) > config.noise_multiplier * sigma_i
+    event_starts, event_ends = _runs(significant)
+    # 仅合并过滤窗口范围内的短暂过零，不把相隔很远的尖峰连接成放电段。
+    merged = []
+    for start, end in zip(event_starts, event_ends):
+        if merged and start - merged[-1][1] <= config.median_window:
+            merged[-1][1] = int(end)
+        else:
+            merged.append([int(start), int(end)])
+    bounded = [(start, end) for start, end in merged if start >= guard and end <= n - guard]
+    span = max((end - start for start, end in bounded), default=0) / n
+    u_reference = float(np.quantile(np.abs(voltage), .9))
+    response = u_reference - np.abs(voltage) > config.noise_multiplier * sigma_u
+    paired = float(np.mean((significant & response)[guard:-guard]))
+    return {
+        'baseline_current_A': baseline,
+        'raw_event_count': len(starts),
+        'raw_event_fraction': float(np.mean(raw_mask)),
+        'narrow_event_count': int(np.count_nonzero(lengths <= config.median_window)),
+        'max_event_width_samples': int(np.max(lengths)) if len(lengths) else 0,
+        'oscillation_support_fraction': float(np.mean(significant[guard:-guard])),
+        'bounded_excursion_span_fraction': span,
+        'paired_response_fraction': paired,
+        'pulse_response_supported': (span >= config.oscillation_persistence
+                                     and paired >= config.oscillation_persistence),
+    }
+
+
 def _reversal_indices(values, excursion):
     """累计反向变化超过噪声界才记一次转折，不依赖相邻点导数峰值。"""
     extreme, extreme_index, direction = values[0], 0, 0
@@ -88,12 +158,17 @@ def _step_metrics(current, voltage, sigma_i, sigma_u, config):
     regularizer = n * sigma_i ** 2
     bic_gain = n * np.log((alternative_sse + regularizer) / (errors[best] + regularizer)) - np.log(n)
     # 排除端部复位和过渡带；平台实际长度另行输出，不把末端小段当长平台。
-    before = current[guard:max(guard + 1, split - guard)]
-    after = current[min(split + guard, n - guard - 1):n - guard]
-    u_before = np.abs(voltage[guard:max(guard + 1, split - guard)])
-    u_after = np.abs(voltage[min(split + guard, n - guard - 1):n - guard])
-    pre, post = float(np.median(before)), float(np.median(after))
-    u_pre, u_post = float(np.median(u_before)), float(np.median(u_after))
+    before = current[guard:max(guard, split - guard)]
+    after = current[split + guard:n - guard]
+    u_before = np.abs(voltage[guard:max(guard, split - guard)])
+    u_after = np.abs(voltage[split + guard:n - guard])
+    pre = float(np.median(before)) if len(before) else np.nan
+    post = float(np.median(after)) if len(after) else np.nan
+    u_pre = float(np.median(u_before)) if len(u_before) else np.nan
+    u_post = float(np.median(u_after)) if len(u_after) else np.nan
+    valid_pre = len(before) >= config.min_samples
+    valid_post = len(after) >= config.min_samples
+    supported = valid_pre and valid_post and len(after) / n >= config.min_plateau_fraction
     delta = post - pre
     if abs(delta) > config.noise_multiplier * sigma_i:
         progress = (current - pre) / delta
@@ -107,11 +182,15 @@ def _step_metrics(current, voltage, sigma_i, sigma_u, config):
         'step_index': split, 'step_bic_gain': float(bic_gain),
         'I_jump': abs(post) - abs(pre), 'jump_snr': (abs(post) - abs(pre)) / sigma_i,
         'transition_fraction': float(width), 'plateau_fraction': len(after) / n,
-        'post_current_std': float(np.std(after)), 'post_current_snr': abs(post) / sigma_i,
-        'post_stability_ratio': float(np.mean(np.abs(after - post) <= config.noise_multiplier * sigma_i)),
+        'pre_sample_count': len(before), 'post_sample_count': len(after),
+        'plateau_supported': supported,
+        'post_current_std': float(np.std(after)) if valid_post else np.nan,
+        'post_current_snr': abs(post) / sigma_i if valid_post else np.nan,
+        'post_stability_ratio': (float(np.mean(np.abs(after - post) <= config.noise_multiplier * sigma_i))
+                                 if valid_post else np.nan),
         'voltage_drop_snr': (u_pre - u_post) / sigma_u,
         'voltage_collapse_ratio': u_post / max(u_pre, sigma_u),
-        'post_voltage_std': float(np.std(u_after)),
+        'post_voltage_std': float(np.std(u_after)) if valid_post else np.nan,
     }
 
 
@@ -140,8 +219,8 @@ def extract_features(cycle, config=None):
     if np.max(np.abs(dt / sample_interval - 1)) > 0.01:
         features['data_quality'] = 'irregular_timebase'
         return features
-    sigma_i = _noise_sigma(current, config.analysis_windows)
-    sigma_u = _noise_sigma(voltage, config.analysis_windows)
+    sigma_i, mad_i, level_step_i, noise_model_i, baseline_i = _resolution_model(current, config.analysis_windows)
+    sigma_u, mad_u, level_step_u, noise_model_u, _ = _resolution_model(voltage, config.analysis_windows)
     filtered = median_filter(current, size=config.median_window, mode='nearest')
     filtered_u = median_filter(voltage, size=config.median_window, mode='nearest')
     magnitude, filtered_magnitude = np.abs(current), np.abs(filtered)
@@ -156,6 +235,9 @@ def extract_features(cycle, config=None):
     features.update({
         'sampling_rate_Hz': 1 / sample_interval, 'duration_s': float(time[-1] - time[0]),
         'noise_current': sigma_i, 'noise_voltage': sigma_u,
+        'noise_current_mad': mad_i, 'current_level_step_A': level_step_i,
+        'current_noise_model': noise_model_i, 'noise_voltage_mad': mad_u,
+        'voltage_level_step_V': level_step_u, 'voltage_noise_model': noise_model_u,
         'Ipeak': float(np.max(magnitude)), 'Irms': float(np.sqrt(np.mean(current ** 2))),
         'I_pp': float(np.ptp(magnitude)), 'I_std': float(np.std(magnitude)),
         'signed_I_pp': float(np.ptp(current)), 'signed_I_std': float(np.std(current)),
@@ -177,6 +259,8 @@ def extract_features(cycle, config=None):
         'current_high_std': float(np.std(magnitude[high])) if np.any(high) else 0.0,
         'current_high_time': float(np.count_nonzero(high) * sample_interval),
     })
+    features.update(_event_metrics(current, filtered, filtered_u, baseline_i,
+                                  sigma_i, mad_i, level_step_i, sigma_u, config))
     features.update(_step_metrics(filtered, filtered_u, sigma_i, sigma_u, config))
     return features
 
@@ -184,13 +268,18 @@ def extract_features(cycle, config=None):
 def classify_with_evidence(features, config=None):
     """返回四类建议、原因、短路条件满足比例；分数不是校准概率。"""
     config = config or DynamicConfig()
+    if features.get('model_version') != MODEL_VERSION:
+        raise ValueError('特征模型版本不匹配，必须从原始波形重新提取特征')
     if features['data_quality'] != 'ok':
         return 'abnormal_discharge', features['data_quality'], 0.0
     z = config.noise_multiplier
     oscillatory = (features['reversal_count'] >= config.min_reversals
                    and features['oscillation_index'] >= config.oscillation_persistence
-                   and features['oscillation_span_ratio'] >= config.oscillation_persistence)
+                   and features['oscillation_span_ratio'] >= config.oscillation_persistence
+                   and features['oscillation_support_fraction'] >= config.oscillation_persistence)
     if features['activity_snr'] <= z:
+        if features['current_noise_model'] == 'quantized_resolution_bound' and features['raw_event_count']:
+            return 'abnormal_discharge', 'resolution_limited_events', 0.0
         if features['voltage_snr'] > z:
             return 'open_circuit', 'current_at_noise_floor', 0.0
         return 'abnormal_discharge', 'no_voltage_drive_evidence', 0.0
@@ -206,11 +295,14 @@ def classify_with_evidence(features, config=None):
         features['post_voltage_std'] <= z * features['noise_voltage'],
         not oscillatory,
     )
-    short_score = sum(bool(v) for v in evidence) / len(evidence)
-    if all(evidence):
+    short_score = (sum(bool(v) for v in evidence) / len(evidence)
+                   if features['plateau_supported'] else 0.0)
+    if features['plateau_supported'] and all(evidence):
         return 'short_circuit', 'joint_step_then_stable_plateau', short_score
     if oscillatory and features['voltage_response_snr'] > z:
         return 'effective_discharge', 'sustained_oscillation_with_voltage_response', short_score
+    if features['pulse_response_supported'] and features['voltage_response_snr'] > z:
+        return 'effective_discharge', 'coherent_current_excursion_with_voltage_response', short_score
     reason = 'oscillation_without_voltage_response' if oscillatory else 'active_without_clear_dynamic_pattern'
     return 'abnormal_discharge', reason, short_score
 
@@ -258,4 +350,8 @@ def recognize_discharge_states(data, cycles, output_dir, config=None):
                     'labels_validated': False}, ensure_ascii=False, indent=2), encoding='utf-8')
     print('\n状态统计（自动筛查，尚需人工复核）:')
     print(result['state'].value_counts().reindex(STATES, fill_value=0))
+    print('模型版本:', MODEL_VERSION)
+    if 'current_noise_model' in result:
+        print('电流噪声/分辨尺度模型:', result['current_noise_model'].value_counts().to_dict())
+        print('没有足够前后平台证据的周期:', int(result['plateau_supported'].ne(True).sum()))
     return result

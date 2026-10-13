@@ -24,7 +24,8 @@ def plot_cycle(data, row, save_path, title=None):
         for axis in axes:
             axis.legend(loc='best')
             axis.grid(alpha=.2)
-        fig.suptitle(title or f"Cycle {row['cycle_id']} | {row['state']}\n{row['classification_reason']}")
+        fig.suptitle(title or f"Cycle {row['cycle_id']} | {row['state']}\n"
+                             f"{row.get('model_version', 'unknown version')}\n{row['classification_reason']}")
         fig.tight_layout()
         path = Path(save_path)
         path.parent.mkdir(parents=True, exist_ok=True)
