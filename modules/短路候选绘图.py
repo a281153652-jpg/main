@@ -1,171 +1,33 @@
-import os
-import pandas as pd
-import matplotlib.pyplot as plt
+from pathlib import Path
 
+import pandas as pd
 
 from modules.data_loader import load_waveform_data
 from modules.周期检测 import detect_cycles
-
-
-
-def plot_short_candidates(
-        input_file,
-        score_file,
-        output_dir,
-        number=10
-):
-
-
-    print("="*70)
-    print("绘制短路候选波形")
-    print("="*70)
-
-
-
-    os.makedirs(
-        output_dir,
-        exist_ok=True
-    )
-
-
-    # -------------------
-    # 读取候选结果
-    # -------------------
-
-    candidate = pd.read_csv(
-        score_file
-    )
-
-
-    candidate = candidate.head(
-        number
-    )
-
-
-    print(
-        "绘制周期:"
-    )
-
-    print(
-        candidate["cycle_id"].values
-    )
-
-
-
-    # -------------------
-    # 读取原始波形
-    # -------------------
-
-    data = load_waveform_data(
-        input_file
-    )
-
-
-    cycles = detect_cycles(
-        data,
-        output_dir
-    )
-
-
-
-    # -------------------
-    # 绘图
-    # -------------------
-
-    for _,row in candidate.iterrows():
-
-
-        cycle_id=int(
-            row["cycle_id"]
-        )
-
-
-        cycle_info = cycles[
-            cycles["cycle_id"]
-            ==
-            cycle_id
-        ]
-
-
-        if len(cycle_info)==0:
-            continue
-
-
-        start=int(
-            cycle_info.iloc[0]["start_index"]
-        )
-
-        end=int(
-            cycle_info.iloc[0]["end_index"]
-        )
-
-
-        cycle=data.iloc[
-            start:end
-        ]
-
-
-
-        fig,ax1=plt.subplots(
-            figsize=(10,5)
-        )
-
-
-        ax1.plot(
-            cycle["time"],
-            cycle["voltage"],
-            label="Voltage"
-        )
-
-
-        ax1.set_ylabel(
-            "Voltage(V)"
-        )
-
-
-
-        ax2=ax1.twinx()
-
-
-        ax2.plot(
-            cycle["time"],
-            cycle["current"],
-            label="Current"
-        )
-
-
-        ax2.set_ylabel(
-            "Current(A)"
-        )
-
-
-
-        plt.title(
-            f"Short candidate cycle {cycle_id}\nscore={row['short_score']:.3f}"
-        )
-
-
-        plt.tight_layout()
-
-
-
-        save=os.path.join(
-            output_dir,
-            f"cycle_{cycle_id}.png"
-        )
-
-
-        plt.savefig(
-            save,
-            dpi=300
-        )
-
-
-        plt.close()
-
-
-
-        print(
-            "保存:",
-            save
-        )
+from modules.状态验证绘图 import plot_cycle
+
+
+def plot_short_candidates(input_file, score_file, output_dir, number=10, *, data=None, cycles=None):
+    """保持旧调用方式，也允许复用内存中的数据和周期，不重复读取千万点 CSV。"""
+    if number < 1:
+        raise ValueError('候选图片数量必须为正整数')
+    candidate = pd.read_csv(score_file).head(number)
+    if candidate.empty:
+        print('没有可绘制的短路候选')
+        return []
+    if data is None:
+        data = load_waveform_data(input_file)
+    if not {'start_index', 'end_index'}.issubset(candidate):
+        if cycles is None:
+            cycles = detect_cycles(data, output_dir)
+        candidate = candidate.merge(cycles[['cycle_id', 'start_index', 'end_index']],
+                                    on='cycle_id', how='left', validate='one_to_one')
+        if candidate[['start_index', 'end_index']].isna().any().any():
+            raise ValueError('候选周期无法匹配周期边界，请重新生成候选表')
+    paths = []
+    for _, row in candidate.iterrows():
+        path = Path(output_dir) / f"cycle_{int(row['cycle_id'])}.png"
+        title = f"Short candidate cycle {int(row['cycle_id'])} | evidence score={row['short_score']:.2f}"
+        plot_cycle(data, row, path, title=title)
+        paths.append(path)
+    return paths

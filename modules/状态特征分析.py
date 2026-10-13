@@ -1,180 +1,35 @@
-import os
+from pathlib import Path
+
 import pandas as pd
 
-
-
-def analyze_features(
-        result_file,
-        output_dir
-):
-
-    print("="*70)
-    print("放电状态特征分布分析")
-    print("="*70)
-
-
-
-    df = pd.read_csv(
-        result_file
-    )
-
-
-    print(
-        "周期数量:",
-        len(df)
-    )
-
-
-
-    features = [
-
-    "Ipeak",
-
-    "Irms",
-
-    "discharge_ratio",
-
-    "energy_J",
-
-    "voltage_low_ratio",
-
-    "voltage_std",
-
-    "current_high_ratio",
-
-    "current_high_std",
-
-    "current_high_time",
-
-    "I_jump",
-
-    "di_dt_max",
-
-    "I_rise_time"
-
+FEATURES = [
+    'Ipeak', 'Irms', 'I_pp', 'I_std', 'signed_I_pp', 'signed_I_std', 'robust_I_pp',
+    'change_count', 'reversal_count', 'oscillation_index', 'oscillation_span_ratio',
+    'noise_current', 'activity_snr', 'I_jump', 'step_bic_gain', 'transition_fraction',
+    'plateau_fraction', 'post_current_std', 'post_stability_ratio',
+    'voltage_drop_snr', 'voltage_collapse_ratio', 'voltage_std',
+    'energy_J', 'energy_signed_J', 'discharge_ratio', 'short_score',
 ]
 
 
-
-    stat = []
-
-
-
-    for f in features:
-
-
-        if f not in df.columns:
-
-            continue
-
-
-        data = df[f]
-
-
-        stat.append({
-
-            "feature":f,
-
-            "min":
-                data.min(),
-
-            "25%":
-                data.quantile(0.25),
-
-            "50%":
-                data.quantile(0.5),
-
-            "75%":
-                data.quantile(0.75),
-
-            "90%":
-                data.quantile(0.9),
-
-            "95%":
-                data.quantile(0.95),
-
-            "max":
-                data.max()
-
+def analyze_features(result_file, output_dir):
+    df = pd.read_csv(result_file)
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    available = [feature for feature in FEATURES if feature in df]
+    records = []
+    for feature in available:
+        values = df[feature]
+        records.append({
+            'feature': feature, 'valid_count': values.count(),
+            'min': values.min(), '25%': values.quantile(.25), '50%': values.quantile(.5),
+            '75%': values.quantile(.75), '90%': values.quantile(.9),
+            '95%': values.quantile(.95), 'max': values.max(),
         })
-
-
-
-    stat_df = pd.DataFrame(
-        stat
-    )
-
-
-    stat_df.to_csv(
-
-        os.path.join(
-            output_dir,
-            "状态特征统计.csv"
-        ),
-
-        index=False,
-
-        encoding="utf-8-sig"
-
-    )
-
-
-    print("\n总体特征分布:")
-    print(stat_df)
-
-
-
-    print("\n当前分类数量:")
-
-    print(
-        df["state"]
-        .value_counts()
-    )
-
-
-
-    print("\n子状态:")
-
-    print(
-        df["sub_state"]
-        .value_counts()
-    )
-
-
-
-    # 分状态统计
-
-    print(
-        "\n各状态特征均值:"
-    )
-
-
-    mean_df = (
-
-        df
-        .groupby("state")
-        [features]
-        .mean()
-
-    )
-
-
-    print(
-        mean_df
-    )
-
-
-    mean_df.to_csv(
-
-        os.path.join(
-            output_dir,
-            "各状态特征均值.csv"
-        ),
-
-        encoding="utf-8-sig"
-
-    )
-
-
-
-    return stat_df
+    stats = pd.DataFrame(records, columns=['feature', 'valid_count', 'min', '25%', '50%',
+                                         '75%', '90%', '95%', 'max'])
+    stats.to_csv(output / '状态特征统计.csv', index=False, encoding='utf-8-sig')
+    df.groupby('state')[available].mean().to_csv(output / '各状态特征均值.csv', encoding='utf-8-sig')
+    print('\n各状态特征均值:')
+    print(df.groupby('state')[available].mean())
+    return stats
