@@ -74,6 +74,12 @@ SUMMARY_COLUMNS = (
     'stability_baseline_replay_matches', 'stability_review_priority_suggestion',
     'stability_is_state_probability', 'stability_is_experimental_validation',
 )
+CHAIN_COMPARISON_COLUMNS = ('stability_evidence_model_version', 'stability_compares_return_chains')
+
+
+def _load_return_chain_model():
+    from modules.局部事件链模型 import EVENT_MODEL_VERSION as version, fit_local_return_chains
+    return version, fit_local_return_chains
 
 
 def _canonical_empty(value):
@@ -81,7 +87,7 @@ def _canonical_empty(value):
     return value is None or (isinstance(value, str) and value == '') or bool(pd.isna(value))
 
 
-def _event_evidence(event):
+def _event_evidence(event, expected_version=EVENT_MODEL_VERSION):
     if not isinstance(event, dict) or not {'event_supported', 'event_reason'} <= set(event):
         raise ValueError('事件模型必须返回 event_supported 和 event_reason 的平坦字典')
     for name, value in event.items():
@@ -95,7 +101,7 @@ def _event_evidence(event):
     event['event_supported'] = _boolean(event['event_supported'], 'event_supported')
     if not isinstance(event['event_reason'], str) or not event['event_reason']:
         raise ValueError('event_reason 必须为非空文本')
-    if event.get('event_model_version') != EVENT_MODEL_VERSION:
+    if event.get('event_model_version') != expected_version:
         raise ValueError('事件模型返回的版本与本审计支持版本不一致')
     return event
 
@@ -153,7 +159,7 @@ def _validate_results(frame, config):
     ordered = frame.sort_values('start_index')
     if (ordered['start_index'].to_numpy()[1:] < ordered['end_index'].to_numpy()[:-1]).any():
         raise ValueError('结果表原周期边界存在重叠')
-    if set(SUMMARY_COLUMNS) & set(frame):
+    if set(SUMMARY_COLUMNS + CHAIN_COMPARISON_COLUMNS) & set(frame):
         raise ValueError('输入已含本审计摘要列，请使用局部事件复核结果表')
 
 
@@ -163,7 +169,9 @@ def _spread(events, name):
 
 
 def audit_event_stability(raw_source, *, results, model_config, expected_source_sha256,
-                          output_dir, include_retained=False):
+                          output_dir, include_retained=False, compare_return_chains=False):
+    if not isinstance(compare_return_chains, bool):
+        raise ValueError('compare_return_chains 必须为布尔值')
     expected = _fingerprint(expected_source_sha256, '--expected-source-sha256')
     result_path, config_path, source_path = map(Path, (results, model_config, raw_source))
     snapshot, result_hash = _snapshot(result_path)
@@ -192,6 +200,10 @@ def audit_event_stability(raw_source, *, results, model_config, expected_source_
     event_columns = [name for name in original if name.startswith('event_')]
     base = LocalEventConfig(noise_multiplier=config.noise_multiplier,
                            min_segment_samples=config.min_samples)
+    evidence_version, evidence_fit = (_load_return_chain_model() if compare_return_chains
+                                      else (EVENT_MODEL_VERSION, fit_local_events))
+    if compare_return_chains:
+        print('对照事件模型:', evidence_version, '；原 v1 证据重演后单独比较，不改变标签。', flush=True)
     trial_configs = [replace(base, max_segments=budget) for budget in BUDGETS]
     details, summaries = [], []
     last_progress = time.monotonic()
@@ -202,10 +214,12 @@ def audit_event_stability(raw_source, *, results, model_config, expected_source_
         # 先重演原预算；出现差异时不能用不同版本/设置悄悄取代原证据。
         baseline = _event_evidence(fit_local_events(block, features, config=base))
         _match_event(row, baseline, event_columns)
+        trial_baseline = (_event_evidence(evidence_fit(block, features, config=base), evidence_version)
+                          if compare_return_chains else baseline)
         events = []
         for trial_config in trial_configs:
-            event = (baseline if trial_config.max_segments == BASELINE_BUDGET else
-                     _event_evidence(fit_local_events(block, features, config=trial_config)))
+            event = (trial_baseline if trial_config.max_segments == BASELINE_BUDGET else
+                     _event_evidence(evidence_fit(block, features, config=trial_config), evidence_version))
             events.append(event)
             details.append({'cycle_id': int(row['cycle_id']),
                             'start_index': int(row['start_index']), 'end_index': int(row['end_index']),
@@ -221,7 +235,9 @@ def audit_event_stability(raw_source, *, results, model_config, expected_source_
                 last_progress = time.monotonic()
         supported = [budget for budget, event in zip(BUDGETS, events) if event['event_supported']]
         preserved = original.loc[original['cycle_id'].eq(row['cycle_id'])].iloc[0].to_dict()
-        summaries.append({**preserved, 'stability_supported_budgets': '|'.join(map(str, supported)),
+        comparison = ({'stability_evidence_model_version': evidence_version,
+                       'stability_compares_return_chains': True} if compare_return_chains else {})
+        summaries.append({**preserved, **comparison, 'stability_supported_budgets': '|'.join(map(str, supported)),
                           'stability_supported_budget_count': len(supported),
                           'stability_supported_all_budgets': len(supported) == len(BUDGETS),
                           'stability_supported_any_budget': bool(supported),
@@ -234,7 +250,8 @@ def audit_event_stability(raw_source, *, results, model_config, expected_source_
                           'stability_is_experimental_validation': False})
     for path, fingerprint in ((result_path, result_hash), (config_path, config_hash), (source_path, source_hash)):
         _unchanged(path, fingerprint)
-    summary = pd.DataFrame(summaries, columns=[*original.columns, *SUMMARY_COLUMNS])
+    comparison_columns = list(CHAIN_COMPARISON_COLUMNS) if compare_return_chains else []
+    summary = pd.DataFrame(summaries, columns=[*original.columns, *SUMMARY_COLUMNS, *comparison_columns])
     detail_columns = ['cycle_id', 'start_index', 'end_index', 'automatic_state', 'new_automatic_state',
                       'trial_max_segments', 'trial_noise_multiplier', 'trial_min_segment_samples',
                       'trial_max_boundary_candidates']
@@ -242,6 +259,8 @@ def audit_event_stability(raw_source, *, results, model_config, expected_source_
     metadata = {
         'audit_version': AUDIT_VERSION, 'feature_version': MODEL_VERSION,
         'event_model_version': EVENT_MODEL_VERSION,
+        'stability_evidence_model_version': evidence_version,
+        'return_chain_comparison_enabled': compare_return_chains,
         'source_file': str(source_path.resolve()), 'source_sha256': source_hash,
         'expected_source_sha256': expected, 'independent_source_sha256_verified': True,
         'source_samples': source_samples, 'waveform_data_loaded': not selected.empty,
@@ -262,13 +281,14 @@ def audit_event_stability(raw_source, *, results, model_config, expected_source_
         'experimental_accuracy_assessed': False, 'audit_validates_candidate_labels': False,
         'event_bounds_are_proven_physical_onsets': False,
         'larger_segment_budget_is_more_correct': False,
-        'diagnostic_note': '仅比较固定观测尺度/最小段长/边界网格下的分段预算 4/6/8/10；稳定不代表真值，变化不代表错误；分段更细并不保证证据更正确；事件边界是模型提案，未验证为物理起止点；摘要全部原列保留。',
+        'diagnostic_note': '原 v1 预算 6 始终独立重演核对。分段预算 4/6/8/10 的支持及定位诊断属于 stability_evidence_model_version 指定模型；固定观测尺度/最小段长/边界网格，稳定不代表真值，变化不代表错误；分段更细不保证更正确；事件边界是模型提案，未验证为物理起止点；摘要全部原列保留。',
         'known_development_control': {
+            'reference_event_model_version': EVENT_MODEL_VERSION,
             'source_filename': 'gyb1-4.csv',
             'source_sha256': '6faa67c6c37dedd0d39f4ce039c0bff9bdcb84baef3b88feeb06b429a313f047',
             'cycle_id': 570,
             'applies_to_this_source': source_hash == '6faa67c6c37dedd0d39f4ce039c0bff9bdcb84baef3b88feeb06b429a313f047',
-            'note': '该开发源的周期 570 已获人工有效确认；片段探查中预算 4/6/8 支持、10 不支持。不是其他实验同编号的真值，也不用于本工具分类。',
+            'note': '该开发源的周期 570 已获人工有效确认；历史 v1 片段探查中预算 4/6/8 支持、10 不支持。这是原模型的历史诊断，不代表本次回落链对照结果。不是其他实验同编号的真值，也不用于本工具分类。',
         },
     }
     metadata_text = json.dumps(metadata, ensure_ascii=False, indent=2, allow_nan=False) + '\n'
@@ -292,12 +312,15 @@ def main(argv=None):
     parser.add_argument('--model-config', required=True, help='完整记录原 v4 DynamicConfig 的 JSON')
     parser.add_argument('--expected-source-sha256', required=True, help='已知原始 CSV SHA-256')
     parser.add_argument('--include-retained', action='store_true', help='同时审计原已有效的候选；默认只审计新增有效候选')
+    parser.add_argument('--compare-return-chains', action='store_true',
+                        help='先核对原 v1 证据，再用独立回落链模型比较预算；不改变已有标签')
     parser.add_argument('--output', default='../输出结果/分段稳定性审计')
     args = parser.parse_args(argv)
     try:
         return audit_event_stability(args.raw_source, results=args.results, model_config=args.model_config,
                                      expected_source_sha256=args.expected_source_sha256, output_dir=args.output,
-                                     include_retained=args.include_retained)
+                                     include_retained=args.include_retained,
+                                     compare_return_chains=args.compare_return_chains)
     except (OSError, ValueError, TypeError, KeyError) as error:
         parser.error(str(error))
 

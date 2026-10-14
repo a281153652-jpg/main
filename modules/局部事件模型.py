@@ -167,6 +167,38 @@ def _drive_reference(voltage, start, end, sigma, config):
 
 def fit_local_events(cycle, features, config=None):
     """返回 event_* 独立证据；只检测局部 rise/return，不给物理状态真值。"""
+    return _fit_local_events(cycle, features, config, merge_return_segments=False)
+
+
+def _resolved_path_reversal(current, start, end, direction, limit, width, window_medians=None):
+    """v2 路径守卫：量化小台阶累计反向运动也不能连接成一条腿。"""
+    if end-start < width:
+        return False
+    medians = (window_medians[start:end-width+1] if window_medians is not None else
+               np.array([np.median(current[first:first+width])
+                         for first in range(start, end-width+1)]))
+    oriented = direction*medians
+    return bool(np.any(np.maximum.accumulate(oriented)-oriented > limit))
+
+
+def _background_has_opposite_ownership(references, left, right, orientation, limit):
+    """兼容外层背景包围两个反向高峰时，峰间谷的事件归属存在歧义。"""
+    before = [ref['median'] for ref in references if ref['end'] <= left['start']
+              and orientation*(left['median']-ref['median']) < -limit]
+    after = sorted(ref['median'] for ref in references if ref['start'] >= right['end']
+                   and orientation*(right['median']-ref['median']) < -limit)
+    if not before or not after:
+        return False
+    after = np.asarray(after)
+    for median in before:
+        position = int(np.searchsorted(after, median-2*limit))
+        if position < len(after) and after[position] <= median+2*limit:
+            return True
+    return False
+
+
+def _fit_local_events(cycle, features, config=None, *, merge_return_segments=False):
+    """共享计算；v1 保持原行为，返回连接及累计反向守卫只由独立 v2 启用。"""
     config = config or LocalEventConfig()
     reliable = features.get('current_scale_reliable', False)
     result = {'event_model_version': EVENT_MODEL_VERSION, 'event_supported': False,
@@ -218,6 +250,9 @@ def fit_local_events(cycle, features, config=None):
                   event_boundary_candidates=boundary_count, event_boundary_grid_capped=capped,
                   event_segmentation_working_bic=score)
     limit = config.noise_multiplier*sigma
+    window_medians = (np.median(np.lib.stride_tricks.sliding_window_view(
+        current, config.min_segment_samples), axis=1) if merge_return_segments else None)
+    ownership_references = None
     def resolved_reverse_boundary(index, orientation):
         boundary = parts[index]['start']
         width = config.min_segment_samples
@@ -259,12 +294,49 @@ def fit_local_events(cycle, features, config=None):
             post = _references(current, after_start, after_end, sigma, config)
             compatible = next(((left, right) for right in post for left in pre
                                if abs(left['median']-right['median']) <= 2*limit), None)
+            returning = falling
+            if merge_return_segments:
+                # 只连接同方向/未分辨的返回片段；首个兼容实际背景窗口结束搜索。
+                # 累计反向运动捕获多次小网格台阶形成的另一脉冲，不能只逐边界判断。
+                while True:
+                    compatible = None
+                    for right in post:
+                        left = next((ref for ref in pre
+                                     if abs(ref['median']-right['median']) <= 2*limit), None)
+                        # 路径守卫不依赖前参考；每个 post 只检查一次，
+                        # 避免长背景中大量兼容 pre 重复扫描同一条返回路径。
+                        if left is not None and not _resolved_path_reversal(
+                                current, parts[falling]['start'], right['end'],
+                                -orientation, limit, config.min_segment_samples, window_medians):
+                            compatible = (left, right)
+                            break
+                    if compatible is not None or returning+1 >= len(parts):
+                        break
+                    following = returning+1
+                    boundary = parts[following]['start']
+                    width = config.min_segment_samples
+                    before = np.median(current[boundary-width:boundary])
+                    after = np.median(current[boundary:boundary+width])
+                    if (orientation*parts[following]['delta'] > limit
+                            or orientation*(after-before) > limit
+                            or _resolved_path_reversal(current, parts[falling]['start'],
+                                                       parts[following]['end'],
+                                                       -orientation, limit, width, window_medians)):
+                        break
+                    returning = following
+                    after_start = parts[returning]['end']
+                    after_end = parts[returning+1]['end'] if returning+1 < len(parts) else after_start
+                    post = _references(current, after_start, after_end, sigma, config)
+                candidate.update(event_end_index=parts[returning]['end'],
+                                 event_return_chain_segments=returning-falling+1,
+                                 event_return_chain_start_index=parts[falling]['start'],
+                                 event_return_chain_end_index=parts[returning]['end'])
             if compatible is None:
                 candidate.update(event_reason='background_transition_or_boundary_context_required',
                                  event_boundary_truncated=True)
                 continue
             left, right = compatible
-            first, last = parts[rising]['start'], parts[falling]['end']
+            first, last = parts[rising]['start'], parts[returning]['end']
             width = config.min_segment_samples
             medians = np.array([np.median(current[s:s+width]) for s in range(first, last-width+1)])
             if not len(medians):
@@ -289,6 +361,20 @@ def fit_local_events(cycle, features, config=None):
             # 实际峰窗口的幅度和拟合运动同时支持；一网格短尖峰不能靠外推获支持。
             if rise_amplitude <= limit or return_amplitude <= limit:
                 continue
+            if merge_return_segments and (
+                    _resolved_path_reversal(current, first, peak_start+width,
+                                            orientation, limit, width, window_medians)
+                    or _resolved_path_reversal(current, peak_start, right['end'],
+                                               -orientation, limit, width, window_medians)):
+                candidate['event_reason'] = 'resolved_reversal_within_event_chain'
+                continue
+            if merge_return_segments:
+                if ownership_references is None:
+                    ownership_references = _references(current, 0, len(current), sigma, config)
+                if _background_has_opposite_ownership(ownership_references, left, right,
+                                                      orientation, limit):
+                    candidate['event_reason'] = 'ambiguous_background_owned_by_opposite_excursions'
+                    continue
             gain, null_model = _structure_scores(current, left['start'], right['end'], parts, sigma)
             # 电压可先于电流上升响应。驱动参考在同一事件之前的背景片段中独立查找，
             # 不以已降压的最后一个电流背景窗口充当原始驱动电压，也不借用事件后的变化。
