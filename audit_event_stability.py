@@ -1,23 +1,58 @@
 """只读审计局部事件分段预算敏感性；支持次数不是状态概率或准确率。"""
 import argparse
+from contextlib import contextmanager
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from io import BytesIO
 import json
 from pathlib import Path
 import time
+from threading import Event, Thread
 from uuid import uuid4
 
-import numpy as np
-import pandas as pd
 
-from modules.data_loader import load_waveform_data
-from modules.局部事件模型 import EVENT_MODEL_VERSION, LocalEventConfig, fit_local_events
-from modules.放电状态识别 import MODEL_VERSION, STATES, extract_features
-from refine_waveform_events import (
-    _boolean, _fingerprint, _integer_column, _load_config, _match_features,
-    _sha256, _snapshot, _unchanged, _validate_frame, _waveform_valid,
-)
+@contextmanager
+def _dependency_loading_progress(enabled, interval=10.):
+    """命令行导入前即显示进度；作为模块使用时保持安静。"""
+    if not enabled:
+        yield
+        return
+    stop = Event()
+    started = time.monotonic()
+
+    def heartbeat():
+        while not stop.wait(interval):
+            elapsed = int(time.monotonic()-started)
+            print(f'分析依赖仍在加载，已等待 {elapsed} 秒。', flush=True)
+
+    worker = Thread(target=heartbeat, name='event-audit-startup', daemon=True)
+    print('正在加载分析依赖，首次启动可能较慢…', flush=True)
+    worker.start()
+    interrupted = False
+    try:
+        yield
+    except KeyboardInterrupt:
+        interrupted = True
+    finally:
+        stop.set()
+        worker.join()
+    if interrupted:
+        print('依赖加载已中断，可重新运行；原始输入和已有结果保持。', flush=True)
+        raise SystemExit(130) from None
+    print('分析依赖加载完成。', flush=True)
+
+
+with _dependency_loading_progress(__name__ == '__main__'):
+    import numpy as np
+    import pandas as pd
+
+    from modules.data_loader import load_waveform_data
+    from modules.局部事件模型 import EVENT_MODEL_VERSION, LocalEventConfig, fit_local_events
+    from modules.放电状态识别 import MODEL_VERSION, STATES, extract_features
+    from refine_waveform_events import (
+        _boolean, _fingerprint, _integer_column, _load_config, _match_features,
+        _sha256, _snapshot, _unchanged, _validate_frame, _waveform_valid,
+    )
 
 
 BUDGETS = (4, 6, 8, 10)
@@ -268,4 +303,8 @@ def main(argv=None):
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print('审计已中断，可重新运行；原始输入和已有候选结果保持。', flush=True)
+        raise SystemExit(130) from None

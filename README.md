@@ -179,7 +179,7 @@ git pull --ff-only
 新增 32 个候选均选择到 6 段搜索上限。`audit_event_stability.py` 自动选这些候选，重演并核对原 6 段证据，再比较 4/6/8/10 段预算。增加 `--include-retained` 可检查全部 115 个建议：
 
 ```bash
-.venv-py312/bin/python -W error::FutureWarning audit_event_stability.py "../输入数据/gyb1-4.csv" \
+.venv-py312/bin/python -u -W error::FutureWarning audit_event_stability.py "../输入数据/gyb1-4.csv" \
   --results "../输出结果/局部事件复核_v1/20261014T131253Z_875f5c93/局部事件复核结果.csv" \
   --model-config "../输出结果/动态特征复核_v4/识别模型参数.json" \
   --expected-source-sha256 6faa67c6c37dedd0d39f4ce039c0bff9bdcb84baef3b88feeb06b429a313f047 \
@@ -187,5 +187,7 @@ git pull --ff-only
 ```
 
 输出独立目录中的 `分段稳定性明细.csv`、`分段稳定性摘要.csv` 与 `运行来源.json`，摘要保留所选周期全部原列。工具核对源文件、原配置、原 v4 描述量及预算 6 的全部事件证据；任何重演不符都在写出前停止。14 项相关检查在 FutureWarning 作为错误时通过。
+
+命令启动后立即显示依赖加载提示，加载期间每 10 秒报告等待时间；`-u` 使后续读取和审计进度及时显示。如果在加载阶段按 `Ctrl+C`，会显示中断提示并退出，可重新运行同一命令。显式指定 `.venv-py312/bin/python` 时，即使终端提示符仍显示 `(.venv)`，也使用 Python 3.12 环境，无需再次激活或安装依赖。
 
 设置稳定性不是真值或概率，也不用于撤销标签。已有 15 个真实开发周期探索中，297、695 的支持判断在各预算一致，但 297 的边界提案会漂移；已确认有效的 570 在预算 10 下反而漏检，因为回落被拆段后找不到紧邻后背景。因此更细分段不一定更正确，原标签始终保持。
