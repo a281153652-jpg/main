@@ -10,6 +10,7 @@ from scipy.ndimage import median_filter
 
 STATES = ('open_circuit', 'effective_discharge', 'short_circuit', 'abnormal_discharge')
 MODEL_VERSION = 'dynamic-screening-v4'
+DECISION_RULE_VERSION = 'dynamic-decision-v4.1'
 
 
 @dataclass(frozen=True)
@@ -332,12 +333,6 @@ def classify_with_evidence(features, config=None):
                    and features['oscillation_index'] >= config.oscillation_persistence
                    and features['oscillation_span_ratio'] >= config.oscillation_persistence
                    and features['oscillation_support_fraction'] >= config.oscillation_persistence)
-    if features['activity_snr'] <= z:
-        if features['current_noise_model'] == 'quantized_resolution_bound' and features['raw_event_count']:
-            return 'abnormal_discharge', 'resolution_limited_events', 0.0
-        if features['voltage_snr'] > z:
-            return 'open_circuit', 'current_at_noise_floor', 0.0
-        return 'abnormal_discharge', 'no_voltage_drive_evidence', 0.0
     evidence = (
         features['step_bic_gain'] > 0,
         features['jump_snr'] > z,
@@ -360,6 +355,14 @@ def classify_with_evidence(features, config=None):
         return 'effective_discharge', 'coherent_current_excursion_with_voltage_response', short_score
     if features['edge_pulse_response_supported'] and features['voltage_response_snr'] > z:
         return 'effective_discharge', 'complete_excursion_outside_edge_backgrounds', short_score
+    # 全周期 RMS 随占空比降低，不能否决已取得局部幅度及联合时间支持的事件。
+    # 保留原幅度/持续时间条件；无联合支持时才使用整体活动作背景尺度判断。
+    if features['activity_snr'] <= z:
+        if features['current_noise_model'] == 'quantized_resolution_bound' and features['raw_event_count']:
+            return 'abnormal_discharge', 'resolution_limited_events', 0.0
+        if features['voltage_snr'] > z:
+            return 'open_circuit', 'current_at_noise_floor', 0.0
+        return 'abnormal_discharge', 'no_voltage_drive_evidence', 0.0
     reason = 'oscillation_without_voltage_response' if oscillatory else 'active_without_clear_dynamic_pattern'
     return 'abnormal_discharge', reason, short_score
 
@@ -388,6 +391,7 @@ def recognize_discharge_states(data, cycles, output_dir, config=None):
         features = extract_features(data.iloc[int(start):int(end)], config)
         state, reason, short_score = classify_with_evidence(features, config)
         features.update({
+            'decision_rule_version': DECISION_RULE_VERSION,
             'cycle_id': row.cycle_id, 'start_index': int(start), 'end_index': int(end),
             'state': state,
             'sub_state': {'effective_discharge': 'normal', 'abnormal_discharge': 'abnormal'}.get(state, 'none'),
@@ -403,7 +407,8 @@ def recognize_discharge_states(data, cycles, output_dir, config=None):
     output.mkdir(parents=True, exist_ok=True)
     result.to_csv(output / '放电状态结果.csv', index=False, encoding='utf-8-sig')
     (output / '识别模型参数.json').write_text(
-        json.dumps({'model_version': MODEL_VERSION, 'config': asdict(config),
+        json.dumps({'model_version': MODEL_VERSION, 'decision_rule_version': DECISION_RULE_VERSION,
+                    'config': asdict(config),
                     'labels_validated': False}, ensure_ascii=False, indent=2), encoding='utf-8')
     print('\n状态统计（自动筛查，尚需人工复核）:')
     print(result['state'].value_counts().reindex(STATES, fill_value=0))
